@@ -22,6 +22,8 @@ from gesture_controller import TwoHandJoinGestureController, DrawingState, Gestu
 from drawing_manager import AirDrawingManager
 from one_euro_filter import HandLandmarkSmoother
 from threaded_camera import ThreadedCameraStream
+from image_quality_assessor import ImageQualityAssessor, ImageCondition, ImageQualityMetrics
+from adaptive_enhancer import AdaptiveImageEnhancer
 
 
 class HandTracker:
@@ -77,6 +79,23 @@ class HandTracker:
         self.tracking_loss_duration = {"Left": 0.0, "Right": 0.0}
         self.show_hud = getattr(config, "SHOW_DEBUG_HUD", False)
 
+        # Quality Assessment & Adaptive Enhancement
+        self.quality_assessor = ImageQualityAssessor(
+            blur_sharpness_threshold=config.QUALITY_BLUR_SHARPNESS_THRESHOLD,
+            noise_threshold=config.QUALITY_NOISE_THRESHOLD,
+            dark_threshold=config.QUALITY_DARK_THRESHOLD,
+            bright_threshold=config.QUALITY_BRIGHT_THRESHOLD,
+            contrast_threshold=config.QUALITY_LOW_CONTRAST_THRESHOLD,
+        )
+        self.enhancer = AdaptiveImageEnhancer(
+            clahe_clip_limit=config.CLAHE_CLIP_LIMIT,
+            clahe_grid_size=config.CLAHE_GRID_SIZE,
+            dark_gamma=config.DARK_GAMMA,
+            bright_gamma=config.BRIGHT_GAMMA,
+        )
+        self.last_quality_metrics: Optional[ImageQualityMetrics] = None
+        self.last_enhancement_info: Optional[Dict[str, Any]] = None
+
     def process(self, frame: np.ndarray, current_time: Optional[float] = None) -> Tuple[Dict[str, Any], Any]:
         """
         Process a BGR frame through MediaPipe Hands with adaptive smoothing.
@@ -91,8 +110,14 @@ class HandTracker:
             "Right": None,
         }
 
-        # MediaPipe requires RGB format
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # 1. Assess image quality and conditionally apply lightweight enhancement
+        metrics = self.quality_assessor.assess(frame)
+        self.last_quality_metrics = metrics
+        proc_frame, enh_info = self.enhancer.enhance(frame, metrics)
+        self.last_enhancement_info = enh_info
+
+        # 2. MediaPipe requires RGB format
+        rgb_frame = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2RGB)
         rgb_frame.flags.writeable = False
         results = self.hands.process(rgb_frame)
         rgb_frame.flags.writeable = True
@@ -381,10 +406,9 @@ class HandTracker:
         - Dual-Zone boundaries & coordinates
         - Two-Hand Join gesture status, hold progress & cooldown
         """
-        panel_w = 300
-        panel_h = 405
-        panel_x = 8
-        panel_y = 34
+        panel_w = 310
+        panel_h = 445
+        panel_y = 6
 
         overlay = frame.copy()
         cv2.rectangle(
@@ -403,9 +427,9 @@ class HandTracker:
             1,
         )
 
-        curr_y = panel_y + 20
+        curr_y = panel_y + 18
 
-        # Section 1: Performance Diagnostics
+        # Section 1: Performance Diagnostics & Image Quality Assessment
         cam_fps = perf_metrics.get("camera_fps", 0.0) if perf_metrics else 0.0
         proc_fps = perf_metrics.get("proc_fps", 0.0) if perf_metrics else 0.0
         proc_ms = perf_metrics.get("proc_ms", 0.0) if perf_metrics else 0.0
@@ -420,20 +444,20 @@ class HandTracker:
             2,
             cv2.LINE_AA,
         )
-        curr_y += 18
+        curr_y += 16
         fps_text = f"Camera: {cam_fps:.1f} FPS | Proc: {proc_fps:.1f} FPS ({proc_ms:.1f} ms)"
         cv2.putText(
             frame,
             fps_text,
             (panel_x + 12, curr_y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.42,
+            0.40,
             (0, 255, 255),
             1,
             cv2.LINE_AA,
         )
 
-        curr_y += 16
+        curr_y += 15
         loss_text = (
             f"Tracking Losses: L={self.tracking_loss_count['Left']} | "
             f"R={self.tracking_loss_count['Right']} | Smooth: {'ON' if self.use_smoothing else 'OFF'}"
@@ -443,24 +467,49 @@ class HandTracker:
             loss_text,
             (panel_x + 12, curr_y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.40,
+            0.39,
             config.COLOR_TEXT,
             1,
             cv2.LINE_AA,
         )
 
-        curr_y += 10
+        # Image Quality Assessment & Adaptive Enhancement
+        curr_y += 15
+        if self.last_quality_metrics:
+            m = self.last_quality_metrics
+            enh = self.last_enhancement_info or {}
+            enh_name = enh.get("method", "BYPASS")
+            enh_ms = enh.get("time_ms", 0.0)
+            q_color = (0, 255, 128) if m.condition.value == "NORMAL" else (0, 180, 255)
+            q_text = f"Image: {m.condition.value} | Enh: {enh_name} ({enh_ms:.1f}ms)"
+        else:
+            q_color = (160, 160, 160)
+            q_text = "Image Quality: N/A"
+
+        cv2.putText(
+            frame,
+            q_text,
+            (panel_x + 12, curr_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            q_color,
+            1,
+            cv2.LINE_AA,
+        )
+
+        curr_y += 8
         cv2.line(frame, (panel_x + 8, curr_y), (panel_x + panel_w - 8, curr_y), (60, 60, 60), 1)
 
         is_active = gesture_ctrl.is_drawing_active if gesture_ctrl else False
 
         # Section 2: Left Hand Tracking & Recognition Diagnostics
-        curr_y += 18
+        curr_y += 16
         left = hand_data.get("Left")
         left_detected = left is not None
         left_conf = f"{int(left.get('confidence', 0.0) * 100)}%" if left_detected else "N/A"
+        left_conf_state = drawing_mgr.tracking_confidence_state.get("Left").value if drawing_mgr else "LOST"
         left_det_text = (
-            f"LEFT HAND: DETECTED (Conf: {left_conf})"
+            f"LEFT HAND: DETECTED ({left_conf} | {left_conf_state})"
             if left_detected
             else f"LEFT HAND: LOST (Duration: {self.tracking_loss_duration['Left']:.2f}s)"
         )
@@ -540,12 +589,13 @@ class HandTracker:
         cv2.line(frame, (panel_x + 8, curr_y), (panel_x + panel_w - 8, curr_y), (60, 60, 60), 1)
 
         # Section 3: Right Hand Tracking & Recognition Diagnostics
-        curr_y += 18
+        curr_y += 16
         right = hand_data.get("Right")
         right_detected = right is not None
         right_conf = f"{int(right.get('confidence', 0.0) * 100)}%" if right_detected else "N/A"
+        right_conf_state = drawing_mgr.tracking_confidence_state.get("Right").value if drawing_mgr else "LOST"
         right_det_text = (
-            f"RIGHT HAND: DETECTED (Conf: {right_conf})"
+            f"RIGHT HAND: DETECTED ({right_conf} | {right_conf_state})"
             if right_detected
             else f"RIGHT HAND: LOST (Duration: {self.tracking_loss_duration['Right']:.2f}s)"
         )

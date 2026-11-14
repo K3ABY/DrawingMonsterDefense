@@ -56,6 +56,22 @@ LANDMARK_PINKY_PIP = 18
 LANDMARK_PINKY_DIP = 19
 LANDMARK_PINKY_TIP = 20
 
+# Image Quality Assessment & Adaptive Enhancement Thresholds
+QUALITY_DARK_THRESHOLD = 60.0          # Mean luminance below which image is classified as TOO_DARK
+QUALITY_BRIGHT_THRESHOLD = 195.0       # Mean luminance above which image is classified as TOO_BRIGHT
+QUALITY_LOW_CONTRAST_THRESHOLD = 32.0  # Luminance standard deviation below which contrast is poor / hazy
+QUALITY_BLUR_SHARPNESS_THRESHOLD = 50.0 # Laplacian variance below which frame is motion-blurred
+QUALITY_NOISE_THRESHOLD = 8.0          # High-frequency noise standard deviation threshold
+CLAHE_CLIP_LIMIT = 2.0                 # Contrast limiting factor for CLAHE local equalization
+CLAHE_GRID_SIZE = (8, 8)               # Spatial grid for adaptive histogram equalization
+DARK_GAMMA = 0.65                      # Precomputed Gamma LUT exponent for shadow recovery
+BRIGHT_GAMMA = 1.35                    # Precomputed Gamma LUT exponent for highlight attenuation
+
+# Confidence-Aware Tracking & Safe Drawing Thresholds
+CONFIDENCE_STABLE_MIN = 0.60           # Threshold for TRACKING_STABLE (normal drawing permitted)
+CONFIDENCE_UNCERTAIN_MIN = 0.35        # Threshold for TRACKING_UNCERTAIN (drawing temporarily paused)
+TRACKING_RECOVERY_CONFIRM_FRAMES = 2   # Consecutive stable frames required before resuming new stroke
+
 # 3D Index Finger Pose Recognition Thresholds
 INDEX_STRAIGHTNESS_MIN = 0.76    # 3D Chord-to-segment ratio for straight index finger
 INDEX_PIP_ANGLE_MIN_COS = 0.65   # Cosine of PIP joint angle (straight >= 0.65, ~49 deg)
