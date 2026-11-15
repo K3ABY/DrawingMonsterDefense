@@ -24,3 +24,5 @@ Thumbs.db
 # Logs & Temporary Files
 *.log
 *.tmp
+*.jpg
+test_output.jpg

@@ -232,6 +232,7 @@ class ThreadedCameraStream:
         self.dropped_frame_count: int = 0
         self._fps_timer: float = time.time()
         self._fps_counter: int = 0
+        self._read_buffer: Optional[np.ndarray] = None
 
         # Perform initial camera detection or connection
         self._initialize_camera()
@@ -406,18 +407,24 @@ class ThreadedCameraStream:
             self.camera_status = CameraStatus.FAILED
             self.error_message = "All camera sources unavailable"
 
-    def read_latest(self) -> Tuple[bool, Optional[np.ndarray], bool]:
+    def read_latest(self, copy: bool = False) -> Tuple[bool, Optional[np.ndarray], bool]:
         """
         Returns:
-            (success, frame_copy, is_new_frame)
+            (success, frame, is_new_frame)
             Zero wait time; non-blocking.
+            Reuses internal pre-allocated buffer when copy=False to eliminate heap allocations.
             Returns an informative standby frame if disconnected or failed.
         """
         with self.lock:
             if self.is_connected and self.latest_frame is not None:
                 is_new = self.frame_id > self.last_consumed_id
                 self.last_consumed_id = self.frame_id
-                return True, self.latest_frame.copy(), is_new
+                if copy:
+                    return True, self.latest_frame.copy(), is_new
+                if self._read_buffer is None or self._read_buffer.shape != self.latest_frame.shape:
+                    self._read_buffer = np.empty_like(self.latest_frame)
+                np.copyto(self._read_buffer, self.latest_frame)
+                return True, self._read_buffer, is_new
 
         # Camera disconnected or offline: generate standby screen so game does not crash
         standby_frame = self._generate_standby_frame()

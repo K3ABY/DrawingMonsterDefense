@@ -40,20 +40,20 @@ class AdaptiveImageEnhancer:
         self.clahe = cv2.createCLAHE(clipLimit=clahe_clip_limit, tileGridSize=clahe_grid_size)
 
         # Precompute 256-element Look-Up Tables (LUT) for sub-millisecond gamma correction
-        inv_dark_gamma = 1.0 / dark_gamma
+        # dark_gamma < 1.0 lifts shadows; bright_gamma > 1.0 compresses highlights
         self.lut_dark = np.array(
-            [((i / 255.0) ** inv_dark_gamma) * 255 for i in range(256)], dtype=np.uint8
+            [min(255, int(((i / 255.0) ** dark_gamma) * 255.0 + 0.5)) for i in range(256)], dtype=np.uint8
         )
 
-        inv_bright_gamma = 1.0 / bright_gamma
         self.lut_bright = np.array(
-            [((i / 255.0) ** inv_bright_gamma) * 255 for i in range(256)], dtype=np.uint8
+            [min(255, int(((i / 255.0) ** bright_gamma) * 255.0 + 0.5)) for i in range(256)], dtype=np.uint8
         )
 
-        # Cache for bilateral filter kernels
+        # Cache for bilateral filter kernels and reusable buffers
         self.bilateral_d = 5
         self.bilateral_sigma_color = 30
         self.bilateral_sigma_space = 30
+        self._lut_buffer: Optional[np.ndarray] = None
 
     def enhance(
         self, frame: np.ndarray, metrics: ImageQualityMetrics
@@ -75,23 +75,30 @@ class AdaptiveImageEnhancer:
                 "description": "Original image used (Normal quality)",
             }
 
+        # Ensure reusable buffer is sized to frame
+        if self._lut_buffer is None or self._lut_buffer.shape != frame.shape:
+            self._lut_buffer = np.empty_like(frame)
+
         # 2. Condition TOO_DARK: Fast Gamma Correction via LUT
-        elif condition == ImageCondition.TOO_DARK:
-            enhanced = cv2.LUT(frame, self.lut_dark)
+        if condition == ImageCondition.TOO_DARK:
+            cv2.LUT(frame, self.lut_dark, dst=self._lut_buffer)
+            enhanced = self._lut_buffer
             method = "GAMMA_CORRECTION"
             desc = f"Shadow lifted with Gamma={1.0 / (1.0 / 0.65):.2f}"
 
         # 3. Condition TOO_BRIGHT: Attenuation via LUT
         elif condition == ImageCondition.TOO_BRIGHT:
-            enhanced = cv2.LUT(frame, self.lut_bright)
+            cv2.LUT(frame, self.lut_bright, dst=self._lut_buffer)
+            enhanced = self._lut_buffer
             method = "EXPOSURE_ATTENUATION"
             desc = "Highlights compressed with Gamma attenuation"
 
-        # 4. Condition LOW_CONTRAST / HAZY: CLAHE on L channel
+        # 4. Condition LOW_CONTRAST / HAZY: Contrast stretch + CLAHE on L channel
         elif condition == ImageCondition.LOW_CONTRAST:
             lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
             l_channel, a_channel, b_channel = cv2.split(lab)
-            enhanced_l = self.clahe.apply(l_channel)
+            norm_l = cv2.normalize(l_channel, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
+            enhanced_l = self.clahe.apply(norm_l)
             enhanced_lab = cv2.merge([enhanced_l, a_channel, b_channel])
             enhanced = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
             method = "CLAHE_LOCAL_CONTRAST"

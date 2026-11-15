@@ -45,6 +45,8 @@ class AirDrawingManager:
         self.max_bridge_time = max_bridge_time
         self.max_bridge_dist = max_bridge_dist
         self.stroke_thickness = stroke_thickness
+        self.max_strokes = 100
+        self.max_points_per_hand = 4000
 
         # Strokes storage: hand_label -> list of strokes
         self.strokes: Dict[str, List[List[Dict[str, Any]]]] = {
@@ -411,6 +413,36 @@ class AirDrawingManager:
                 self.pointing_direction[hand_label] = direction if raw_pointing else "NONE"
                 posture = self._update_posture_with_hysteresis(hand_label, raw_pointing, raw_fist, raw_posture)
 
+                # Confidence-Aware Tracking State Evaluation (Section 6)
+                hand_conf = float(hand_info.get("confidence", 0.90))
+                self.hand_detection_confidence[hand_label] = hand_conf
+                self.index_pose_confidence[hand_label] = 0.90
+                prev_conf_state = self.tracking_confidence_state[hand_label]
+
+                if hand_conf >= config.CONFIDENCE_STABLE_MIN:
+                    if prev_conf_state in [TrackingConfidenceState.TRACKING_UNCERTAIN, TrackingConfidenceState.TRACKING_RECOVERED]:
+                        self.recovery_streak[hand_label] += 1
+                        if self.recovery_streak[hand_label] < config.TRACKING_RECOVERY_CONFIRM_FRAMES:
+                            self.tracking_confidence_state[hand_label] = TrackingConfidenceState.TRACKING_RECOVERED
+                        else:
+                            self.tracking_confidence_state[hand_label] = TrackingConfidenceState.TRACKING_STABLE
+                    else:
+                        self.recovery_streak[hand_label] = config.TRACKING_RECOVERY_CONFIRM_FRAMES
+                        self.tracking_confidence_state[hand_label] = TrackingConfidenceState.TRACKING_STABLE
+                elif hand_conf >= config.CONFIDENCE_UNCERTAIN_MIN:
+                    self.recovery_streak[hand_label] = 0
+                    self.tracking_confidence_state[hand_label] = TrackingConfidenceState.TRACKING_UNCERTAIN
+                else:
+                    self.recovery_streak[hand_label] = 0
+                    self.tracking_confidence_state[hand_label] = TrackingConfidenceState.TRACKING_LOST
+
+                # Safe Drawing: If tracking confidence is UNCERTAIN or RECOVERED, pause drawing to avoid wild coordinates!
+                if self.tracking_confidence_state[hand_label] != TrackingConfidenceState.TRACKING_STABLE:
+                    self.active_stroke[hand_label] = None
+                    self.last_seen_point[hand_label] = curr_pt
+                    self.last_seen_time[hand_label] = current_time
+                    continue
+
                 # 3. Boundary Crossing Enforcement:
                 # When leaving permitted zone, immediately break active stroke!
                 if not is_in_zone:
@@ -535,6 +567,11 @@ class AirDrawingManager:
             return "IDLE"
         if not is_detected:
             return "LOST"
+        conf_state = self.tracking_confidence_state.get(hand_label, TrackingConfidenceState.TRACKING_LOST)
+        if conf_state == TrackingConfidenceState.TRACKING_UNCERTAIN:
+            return "TRACKING UNCERTAIN (PAUSED)"
+        elif conf_state == TrackingConfidenceState.TRACKING_RECOVERED:
+            return "RECOVERING (CONFIRMING)"
         b_status = self.boundary_status.get(hand_label, "NO_HAND")
         if b_status == "OUT_OF_ZONE":
             return "OUT OF ZONE"
@@ -593,31 +630,40 @@ class AirDrawingManager:
         frame: np.ndarray,
         is_drawing_active: bool,
         hand_data: Dict[str, Any],
+        copy: bool = False,
     ) -> np.ndarray:
         """
         Renders Dual-Zone Canvas Division, dividing center line,
-        persistent strokes, and dynamic fingertip status markers.
+        persistent strokes via fast vectorized cv2.polylines, and dynamic fingertip status markers.
         """
-        output = frame.copy()
+        output = frame if not copy else frame.copy()
         h, w, _ = output.shape
         x_split = int(w * self.zone_split_ratio)
 
         # 1. Render Dual-Zone Canvas Division and Vertical Dividing Line
         self._render_dual_zone_overlay(output, w, h, x_split)
 
-        # 2. Render Left hand strokes (Cyan)
-        for stroke in self.strokes["Left"]:
-            for i in range(1, len(stroke)):
-                p1 = (stroke[i - 1]["x"], stroke[i - 1]["y"])
-                p2 = (stroke[i]["x"], stroke[i]["y"])
-                cv2.line(output, p1, p2, config.COLOR_DRAW_LEFT, self.stroke_thickness, cv2.LINE_AA)
+        # 2. Render Left hand strokes (Cyan) via single vectorized cv2.polylines call
+        left_strokes = self.strokes["Left"]
+        if left_strokes:
+            polys_left = [
+                np.array([(p["x"], p["y"]) for p in s], dtype=np.int32).reshape((-1, 1, 2))
+                for s in left_strokes
+                if len(s) >= 2
+            ]
+            if polys_left:
+                cv2.polylines(output, polys_left, False, config.COLOR_DRAW_LEFT, self.stroke_thickness, cv2.LINE_AA)
 
-        # 3. Render Right hand strokes (Orange)
-        for stroke in self.strokes["Right"]:
-            for i in range(1, len(stroke)):
-                p1 = (stroke[i - 1]["x"], stroke[i - 1]["y"])
-                p2 = (stroke[i]["x"], stroke[i]["y"])
-                cv2.line(output, p1, p2, config.COLOR_DRAW_RIGHT, self.stroke_thickness, cv2.LINE_AA)
+        # 3. Render Right hand strokes (Orange) via single vectorized cv2.polylines call
+        right_strokes = self.strokes["Right"]
+        if right_strokes:
+            polys_right = [
+                np.array([(p["x"], p["y"]) for p in s], dtype=np.int32).reshape((-1, 1, 2))
+                for s in right_strokes
+                if len(s) >= 2
+            ]
+            if polys_right:
+                cv2.polylines(output, polys_right, False, config.COLOR_DRAW_RIGHT, self.stroke_thickness, cv2.LINE_AA)
 
         # 4. Draw active pen, pointing pose recognition badge, out-of-zone warning, or fist indicator
         if is_drawing_active:

@@ -79,6 +79,10 @@ class HandTracker:
         self.tracking_loss_duration = {"Left": 0.0, "Right": 0.0}
         self.show_hud = getattr(config, "SHOW_DEBUG_HUD", False)
 
+        # Zero-allocation reusable buffers
+        self._rgb_buffer: Optional[np.ndarray] = None
+        self._hud_bg_box: Optional[np.ndarray] = None
+
         # Quality Assessment & Adaptive Enhancement
         self.quality_assessor = ImageQualityAssessor(
             blur_sharpness_threshold=config.QUALITY_BLUR_SHARPNESS_THRESHOLD,
@@ -99,6 +103,7 @@ class HandTracker:
     def process(self, frame: np.ndarray, current_time: Optional[float] = None) -> Tuple[Dict[str, Any], Any]:
         """
         Process a BGR frame through MediaPipe Hands with adaptive smoothing.
+        Uses zero-allocation RGB conversion buffer for maximum performance.
         """
         if current_time is None:
             current_time = time.time()
@@ -116,11 +121,13 @@ class HandTracker:
         proc_frame, enh_info = self.enhancer.enhance(frame, metrics)
         self.last_enhancement_info = enh_info
 
-        # 2. MediaPipe requires RGB format
-        rgb_frame = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2RGB)
-        rgb_frame.flags.writeable = False
-        results = self.hands.process(rgb_frame)
-        rgb_frame.flags.writeable = True
+        # 2. MediaPipe requires RGB format (using reusable zero-allocation buffer)
+        if self._rgb_buffer is None or self._rgb_buffer.shape != proc_frame.shape:
+            self._rgb_buffer = np.empty_like(proc_frame)
+        cv2.cvtColor(proc_frame, cv2.COLOR_BGR2RGB, dst=self._rgb_buffer)
+        self._rgb_buffer.flags.writeable = False
+        results = self.hands.process(self._rgb_buffer)
+        self._rgb_buffer.flags.writeable = True
 
         if results.multi_hand_landmarks and results.multi_handedness:
             detected_hands = []
@@ -232,9 +239,9 @@ class HandTracker:
         # 1. Render Dual-Zone Canvas, center divider, and persistent strokes
         if drawing_mgr is not None:
             is_active = gesture_ctrl.is_drawing_active if gesture_ctrl else False
-            display_frame = drawing_mgr.render_strokes(frame, is_active, hand_data)
+            display_frame = drawing_mgr.render_strokes(frame, is_active, hand_data, copy=False)
         else:
-            display_frame = frame.copy()
+            display_frame = frame
 
         h, w, _ = display_frame.shape
 
@@ -408,17 +415,14 @@ class HandTracker:
         """
         panel_w = 320
         panel_h = 464
+        panel_x = 8
         panel_y = 6
 
-        overlay = frame.copy()
-        cv2.rectangle(
-            overlay,
-            (panel_x, panel_y),
-            (panel_x + panel_w, panel_y + panel_h),
-            (20, 20, 20),
-            -1,
-        )
-        cv2.addWeighted(overlay, 0.82, frame, 0.18, 0, frame)
+        # Fast ROI-only alpha blend (zero full-frame memory allocation)
+        if self._hud_bg_box is None or self._hud_bg_box.shape != (panel_h, panel_w, 3):
+            self._hud_bg_box = np.full((panel_h, panel_w, 3), 20, dtype=np.uint8)
+        roi = frame[panel_y : panel_y + panel_h, panel_x : panel_x + panel_w]
+        cv2.addWeighted(self._hud_bg_box, 0.82, roi, 0.18, 0, dst=roi)
         cv2.rectangle(
             frame,
             (panel_x, panel_y),
@@ -433,6 +437,8 @@ class HandTracker:
         cam_fps = perf_metrics.get("camera_fps", 0.0) if perf_metrics else 0.0
         proc_fps = perf_metrics.get("proc_fps", 0.0) if perf_metrics else 0.0
         proc_ms = perf_metrics.get("proc_ms", 0.0) if perf_metrics else 0.0
+        cpu_val = perf_metrics.get("cpu_percent", 0.0) if perf_metrics else 0.0
+        ram_val = perf_metrics.get("ram_mb", 0.0) if perf_metrics else 0.0
         cam_mode = perf_metrics.get("camera_mode", "UNKNOWN") if perf_metrics else "UNKNOWN"
         cam_status = perf_metrics.get("camera_status", "UNKNOWN") if perf_metrics else "UNKNOWN"
         cam_res = perf_metrics.get("camera_res", "N/A") if perf_metrics else "N/A"
@@ -472,6 +478,19 @@ class HandTracker:
             cv2.FONT_HERSHEY_SIMPLEX,
             0.39,
             (0, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+        curr_y += 15
+        diag_res_text = f"CPU: {cpu_val:.1f}% | RAM: {ram_val:.1f} MB"
+        cv2.putText(
+            frame,
+            diag_res_text,
+            (panel_x + 12, curr_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            (0, 220, 255),
             1,
             cv2.LINE_AA,
         )
@@ -782,9 +801,23 @@ class HandTracker:
 def open_camera_stream(url: str, max_retries: int = 3, retry_delay: float = 1.0) -> Optional[cv2.VideoCapture]:
     """
     Attempts to connect to the video stream URL with retry and friendly error messages.
+    Uses fast socket pre-check to prevent 30-second blocking timeouts when server is offline.
     Maintained for backward compatibility.
     """
     print(f"[HandTracker] Connecting to camera stream at: {url}")
+    try:
+        from urllib.parse import urlparse
+        import socket
+        parsed = urlparse(url)
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if host:
+            with socket.create_connection((host, port), timeout=0.8):
+                pass
+    except Exception as e:
+        print(f"[HandTracker] Camera stream host unreachable at {url}: {e}")
+        return None
+
     for attempt in range(1, max_retries + 1):
         cap = cv2.VideoCapture(url)
         if cap.isOpened():
@@ -843,7 +876,13 @@ def main():
 
     cv2.namedWindow(config.WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
 
-    # Timing and FPS calculations
+    # Timing, Resource, and FPS calculations
+    import psutil
+    process = psutil.Process()
+    cached_cpu = 0.0
+    cached_ram = process.memory_info().rss / (1024 * 1024)
+    last_res_query_time = time.perf_counter()
+
     prev_loop_time = time.perf_counter()
     proc_fps = 0.0
     avg_proc_ms = 0.0
@@ -905,11 +944,18 @@ def main():
             instant_fps = 1.0 / dt_loop if dt_loop > 0 else 0.0
             proc_fps = 0.9 * proc_fps + 0.1 * instant_fps
 
+            if curr_loop_time - last_res_query_time > 0.5:
+                cached_cpu = process.cpu_percent()
+                cached_ram = process.memory_info().rss / (1024 * 1024)
+                last_res_query_time = curr_loop_time
+
             cam_metrics = cam.get_metrics() if config.USE_THREADED_CAMERA else {}
             perf_metrics = {
                 "camera_fps": cam_metrics.get("camera_fps", proc_fps),
                 "proc_fps": proc_fps,
                 "proc_ms": avg_proc_ms,
+                "cpu_percent": cached_cpu,
+                "ram_mb": cached_ram,
                 "camera_mode": cam_metrics.get("camera_mode", "UNKNOWN"),
                 "camera_status": cam_metrics.get("camera_status", "CONNECTED" if ret else "DISCONNECTED"),
                 "camera_source": cam_metrics.get("camera_source", str(config.CAMERA_URL)),
