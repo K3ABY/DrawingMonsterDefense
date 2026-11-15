@@ -886,10 +886,16 @@ def main():
     cv2.namedWindow(config.WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
 
     # Timing, Resource, and FPS calculations
-    import psutil
-    process = psutil.Process()
-    cached_cpu = 0.0
-    cached_ram = process.memory_info().rss / (1024 * 1024)
+    try:
+        import psutil
+        process = psutil.Process()
+        cached_cpu = 0.0
+        cached_ram = process.memory_info().rss / (1024 * 1024)
+    except ImportError:
+        psutil = None
+        process = None
+        cached_cpu = 0.0
+        cached_ram = 0.0
     last_res_query_time = time.perf_counter()
 
     prev_loop_time = time.perf_counter()
@@ -953,9 +959,12 @@ def main():
             instant_fps = 1.0 / dt_loop if dt_loop > 0 else 0.0
             proc_fps = 0.9 * proc_fps + 0.1 * instant_fps
 
-            if curr_loop_time - last_res_query_time > 0.5:
-                cached_cpu = process.cpu_percent()
-                cached_ram = process.memory_info().rss / (1024 * 1024)
+            if process is not None and curr_loop_time - last_res_query_time > 0.5:
+                try:
+                    cached_cpu = process.cpu_percent()
+                    cached_ram = process.memory_info().rss / (1024 * 1024)
+                except Exception:
+                    pass
                 last_res_query_time = curr_loop_time
 
             cam_metrics = cam.get_metrics() if config.USE_THREADED_CAMERA else {}

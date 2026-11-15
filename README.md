@@ -51,7 +51,7 @@
 ### การติดตั้ง (Installation)
 ```bash
 # ติดตั้ง dependencies
-pip install -r requirements.txt
+   pip install -r requirements.txt
 ```
 
 ### การตั้งค่ากล้อง (Configuration)
