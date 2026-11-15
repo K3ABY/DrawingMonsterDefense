@@ -24,5 +24,10 @@ Thumbs.db
 # Logs & Temporary Files
 *.log
 *.tmp
-*.jpg
+
+# Generated Test Outputs & Live Frames (preserve folder via .gitkeep)
+assets/test_outputs/*.jpg
+assets/test_outputs/*.png
+!assets/test_outputs/.gitkeep
+live_hand_detected.jpg
 test_output.jpg
