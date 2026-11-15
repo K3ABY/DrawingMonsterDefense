@@ -405,74 +405,28 @@ class AirDrawingManager:
                 # 2. 3D Index Finger Pose Recognition
                 # Prefer 3D landmarks (x, y, z) when available, falling back to 2D
                 landmarks_3d = hand_info.get("landmarks_3d") or hand_info.get("landmarks", [])
-                raw_pointing, raw_fist, raw_posture, direction, pose_conf = self._analyze_posture_3d(
-                    landmarks_3d, return_confidence=True
-                )
+                raw_pointing, raw_fist, raw_posture, direction = self._analyze_posture_3d(landmarks_3d)
 
                 self.is_pointing_recognized[hand_label] = raw_pointing
                 self.pointing_direction[hand_label] = direction if raw_pointing else "NONE"
                 posture = self._update_posture_with_hysteresis(hand_label, raw_pointing, raw_fist, raw_posture)
 
-                # 3. Confidence Evaluation & State Machine Transitions (Section 4 & 6)
-                raw_det_conf = hand_info.get("confidence", 0.90)
-                det_conf = min(1.0, max(0.0, float(raw_det_conf)))
-                self.hand_detection_confidence[hand_label] = det_conf
-                self.index_pose_confidence[hand_label] = pose_conf
-
-                if raw_pointing or raw_fist:
-                    combined_conf = 0.5 * det_conf + 0.5 * pose_conf
-                else:
-                    combined_conf = det_conf
-                self.tracking_confidence_score[hand_label] = round(combined_conf, 3)
-
-                prev_state = self.tracking_confidence_state[hand_label]
-                if combined_conf >= config.CONFIDENCE_STABLE_MIN:
-                    if prev_state == TrackingConfidenceState.TRACKING_UNCERTAIN:
-                        self.recovery_streak[hand_label] += 1
-                        if self.recovery_streak[hand_label] >= config.TRACKING_RECOVERY_CONFIRM_FRAMES:
-                            self.tracking_confidence_state[hand_label] = TrackingConfidenceState.TRACKING_STABLE
-                            self.recovery_streak[hand_label] = 0
-                        else:
-                            self.tracking_confidence_state[hand_label] = TrackingConfidenceState.TRACKING_RECOVERED
-                    else:
-                        self.tracking_confidence_state[hand_label] = TrackingConfidenceState.TRACKING_STABLE
-                        self.recovery_streak[hand_label] = 0
-                elif combined_conf >= config.CONFIDENCE_UNCERTAIN_MIN:
-                    self.tracking_confidence_state[hand_label] = TrackingConfidenceState.TRACKING_UNCERTAIN
-                    self.recovery_streak[hand_label] = 0
-                else:
-                    self.tracking_confidence_state[hand_label] = TrackingConfidenceState.TRACKING_LOST
-                    self.recovery_streak[hand_label] = 0
-
-                # 4. Boundary Crossing Enforcement:
+                # 3. Boundary Crossing Enforcement:
                 # When leaving permitted zone, immediately break active stroke!
                 if not is_in_zone:
                     self.active_stroke[hand_label] = None
                     self.last_seen_point[hand_label] = None
                     continue
 
-                curr_conf_state = self.tracking_confidence_state[hand_label]
-
-                # 5. Tracking Lost under severe conditions -> Cleanly break stroke!
-                if curr_conf_state == TrackingConfidenceState.TRACKING_LOST:
-                    self.active_stroke[hand_label] = None
-                    self.last_seen_point[hand_label] = None
-                    continue
-
-                # 6. Tracking Uncertain or Recovering -> Temporarily pause drawing safely!
-                # Does NOT add wild erratic points; keeps active_stroke segment alive for potential recovery
-                if curr_conf_state in (TrackingConfidenceState.TRACKING_UNCERTAIN, TrackingConfidenceState.TRACKING_RECOVERED):
-                    continue
-
-                # 7. Fist Pose: Pause drawing for this hand
+                # 4. Fist Pose: Pause drawing for this hand
                 if posture == "FIST":
                     self.active_stroke[hand_label] = None
                     self.last_seen_point[hand_label] = curr_pt
                     self.last_seen_time[hand_label] = current_time
                     continue
 
-                # 8. Pointing Pose with STABLE Confidence: Draw inside assigned zone
-                if posture == "POINTING" and curr_conf_state == TrackingConfidenceState.TRACKING_STABLE:
+                # 5. Pointing Pose: Draw inside assigned zone
+                if posture == "POINTING":
                     last_pt = self.last_seen_point[hand_label]
                     last_t = self.last_seen_time[hand_label]
 
@@ -538,9 +492,6 @@ class AirDrawingManager:
                 self.boundary_status[hand_label] = "NO_HAND"
                 self.is_pointing_recognized[hand_label] = False
                 self.pointing_direction[hand_label] = "NONE"
-                self.tracking_confidence_state[hand_label] = TrackingConfidenceState.TRACKING_LOST
-                self.tracking_confidence_score[hand_label] = 0.0
-                self.recovery_streak[hand_label] = 0
                 if current_time - self.last_seen_time[hand_label] > self.max_bridge_time:
                     self.active_stroke[hand_label] = None
                     self.last_seen_point[hand_label] = None
@@ -567,11 +518,6 @@ class AirDrawingManager:
         b_status = self.boundary_status.get(hand_label, "NO_HAND")
         if b_status == "OUT_OF_ZONE":
             return "Out of Zone"
-        conf_state = self.tracking_confidence_state.get(hand_label, TrackingConfidenceState.TRACKING_LOST)
-        if conf_state == TrackingConfidenceState.TRACKING_UNCERTAIN:
-            return "Uncertain (Paused)"
-        if conf_state == TrackingConfidenceState.TRACKING_RECOVERED:
-            return "Recovering..."
         posture = self.posture_state[hand_label]
         d = self.pointing_direction.get(hand_label, "NONE")
         if posture == "POINTING":
@@ -584,7 +530,7 @@ class AirDrawingManager:
             return "Relaxed (Idle)"
 
     def get_drawing_state_name(self, hand_label: str, is_drawing_active: bool, is_detected: bool) -> str:
-        """Returns exact drawing state string for HUD and testing: DRAWING, FIST PAUSED, OUT OF ZONE, TRACKING UNCERTAIN (PAUSED), RECOVERING, or IDLE."""
+        """Returns exact drawing state string for HUD and testing: DRAWING, FIST PAUSED, OUT OF ZONE, or IDLE."""
         if not is_drawing_active:
             return "IDLE"
         if not is_detected:
@@ -592,11 +538,6 @@ class AirDrawingManager:
         b_status = self.boundary_status.get(hand_label, "NO_HAND")
         if b_status == "OUT_OF_ZONE":
             return "OUT OF ZONE"
-        conf_state = self.tracking_confidence_state.get(hand_label, TrackingConfidenceState.TRACKING_LOST)
-        if conf_state == TrackingConfidenceState.TRACKING_UNCERTAIN:
-            return "TRACKING UNCERTAIN (PAUSED)"
-        elif conf_state == TrackingConfidenceState.TRACKING_RECOVERED:
-            return "RECOVERING"
         posture = self.posture_state.get(hand_label, "UNKNOWN")
         if posture == "FIST":
             return "FIST PAUSED"
@@ -704,38 +645,7 @@ class AirDrawingManager:
                             cv2.LINE_AA,
                         )
 
-                    # Condition B: Tracking Uncertain -> Amber warning marker
-                    elif self.tracking_confidence_state.get(hand_label) == TrackingConfidenceState.TRACKING_UNCERTAIN:
-                        cv2.circle(output, tip, 14, (0, 165, 255), 2, cv2.LINE_AA)
-                        cv2.circle(output, tip, 4, (0, 165, 255), -1, cv2.LINE_AA)
-                        cv2.putText(
-                            output,
-                            "UNCERTAIN (PAUSED)",
-                            (tip[0] + 12, tip[1] + 18),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.40,
-                            (0, 165, 255),
-                            1,
-                            cv2.LINE_AA,
-                        )
-
-                    # Condition C: Tracking Recovering -> Cyan confirmation marker
-                    elif self.tracking_confidence_state.get(hand_label) == TrackingConfidenceState.TRACKING_RECOVERED:
-                        streak = self.recovery_streak.get(hand_label, 1)
-                        cv2.circle(output, tip, 14, (255, 255, 0), 2, cv2.LINE_AA)
-                        cv2.circle(output, tip, 4, (255, 255, 0), -1, cv2.LINE_AA)
-                        cv2.putText(
-                            output,
-                            f"RECOVERING ({streak}/{config.TRACKING_RECOVERY_CONFIRM_FRAMES})",
-                            (tip[0] + 12, tip[1] + 18),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.40,
-                            (255, 255, 0),
-                            1,
-                            cv2.LINE_AA,
-                        )
-
-                    # Condition D: Inside zone and Pointing Recognized -> Prominent Drawing Indicator
+                    # Condition B: Inside zone and Pointing Recognized -> Prominent Drawing Indicator
                     elif posture == "POINTING":
                         pen_color = (
                             config.COLOR_DRAW_LEFT if hand_label == "Left" else config.COLOR_DRAW_RIGHT
@@ -759,7 +669,7 @@ class AirDrawingManager:
                             cv2.LINE_AA,
                         )
 
-                    # Condition E: Inside zone and Fist -> Show Paused Marker
+                    # Condition C: Inside zone and Fist -> Show Paused Marker
                     elif posture == "FIST":
                         cv2.circle(output, tip, 10, config.COLOR_FIST_PAUSED, 2, cv2.LINE_AA)
                         cv2.circle(output, tip, 4, config.COLOR_FIST_PAUSED, -1, cv2.LINE_AA)
@@ -774,7 +684,7 @@ class AirDrawingManager:
                             cv2.LINE_AA,
                         )
 
-                    # Condition F: Inside zone and Open/Relaxed -> Show Idle Pose Badge
+                    # Condition D: Inside zone and Open/Relaxed -> Show Idle Pose Badge
                     else:
                         cv2.circle(output, tip, 8, (180, 180, 180), 1, cv2.LINE_AA)
                         cv2.putText(

@@ -74,11 +74,6 @@ class ImageQualityAssessor:
         self.prev_gray: Optional[np.ndarray] = None
         self.prev_sharpness: float = 100.0
 
-    def reset(self) -> None:
-        """Resets temporal tracking metrics and frame history."""
-        self.prev_gray = None
-        self.prev_sharpness = 100.0
-
     def assess(self, frame: np.ndarray) -> ImageQualityMetrics:
         """
         Assesses image quality of the incoming BGR camera frame.
@@ -114,7 +109,7 @@ class ImageQualityAssessor:
             mean_motion = float(np.mean(diff))
 
             # Motion blur occurs when motion is substantial AND sharpness drops
-            if mean_motion > 3.0 and sharpness < self.blur_sharpness_threshold:
+            if mean_motion > 10.0 and sharpness < self.blur_sharpness_threshold:
                 motion_metric = mean_motion * (self.blur_sharpness_threshold / max(sharpness, 1.0))
             else:
                 motion_metric = mean_motion
@@ -154,12 +149,9 @@ class ImageQualityAssessor:
         )
         is_too_dark = (brightness < self.dark_threshold) or (underexposed_ratio > 0.30 and brightness < 75.0)
         is_too_bright = (brightness > self.bright_threshold) or (overexposed_ratio > 0.35)
-        is_low_contrast = (contrast < self.contrast_threshold) and not is_too_dark and not is_too_bright
-        is_motion_blurred = (
-            ((motion_metric > 8.0 and sharpness < self.blur_sharpness_threshold) or (sharpness < 25.0 and motion_metric > 2.0))
-            and not is_low_contrast
-        )
+        is_motion_blurred = (motion_metric > 18.0) and (sharpness < self.blur_sharpness_threshold)
         is_noisy = (noise_level > self.noise_threshold) and (contrast > 15.0)
+        is_low_contrast = (contrast < self.contrast_threshold) and not is_too_dark and not is_too_bright
 
         if is_backlit:
             condition = ImageCondition.BACKLIT
@@ -170,12 +162,12 @@ class ImageQualityAssessor:
         elif is_too_bright:
             condition = ImageCondition.TOO_BRIGHT
             desc = f"Too Bright (Luminance: {brightness:.1f})"
-        elif is_low_contrast:
-            condition = ImageCondition.LOW_CONTRAST
-            desc = f"Low Contrast / Hazy (Std: {contrast:.1f})"
         elif is_motion_blurred:
             condition = ImageCondition.MOTION_BLURRED
             desc = f"Motion Blurred (Motion: {motion_metric:.1f}, Sharp: {sharpness:.1f})"
+        elif is_low_contrast:
+            condition = ImageCondition.LOW_CONTRAST
+            desc = f"Low Contrast / Hazy (Std: {contrast:.1f})"
         elif is_noisy:
             condition = ImageCondition.NOISY
             desc = f"Camera Noise (Level: {noise_level:.1f})"
@@ -198,3 +190,4 @@ class ImageQualityAssessor:
             assessment_time_ms=assessment_time_ms,
             description=desc,
         )
+

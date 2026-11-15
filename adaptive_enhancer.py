@@ -40,13 +40,14 @@ class AdaptiveImageEnhancer:
         self.clahe = cv2.createCLAHE(clipLimit=clahe_clip_limit, tileGridSize=clahe_grid_size)
 
         # Precompute 256-element Look-Up Tables (LUT) for sub-millisecond gamma correction
-        # dark_gamma < 1.0 (e.g. 0.65) lifts shadows; bright_gamma > 1.0 (e.g. 1.35) compresses highlights
+        inv_dark_gamma = 1.0 / dark_gamma
         self.lut_dark = np.array(
-            [((i / 255.0) ** dark_gamma) * 255 for i in range(256)], dtype=np.uint8
+            [((i / 255.0) ** inv_dark_gamma) * 255 for i in range(256)], dtype=np.uint8
         )
 
+        inv_bright_gamma = 1.0 / bright_gamma
         self.lut_bright = np.array(
-            [((i / 255.0) ** bright_gamma) * 255 for i in range(256)], dtype=np.uint8
+            [((i / 255.0) ** inv_bright_gamma) * 255 for i in range(256)], dtype=np.uint8
         )
 
         # Cache for bilateral filter kernels
@@ -90,13 +91,11 @@ class AdaptiveImageEnhancer:
         elif condition == ImageCondition.LOW_CONTRAST:
             lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
             l_channel, a_channel, b_channel = cv2.split(lab)
-            # Dynamic range stretch followed by CLAHE to penetrate haze/fog
-            stretched_l = cv2.normalize(l_channel, None, alpha=30, beta=225, norm_type=cv2.NORM_MINMAX)
-            enhanced_l = self.clahe.apply(stretched_l)
+            enhanced_l = self.clahe.apply(l_channel)
             enhanced_lab = cv2.merge([enhanced_l, a_channel, b_channel])
             enhanced = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
             method = "CLAHE_LOCAL_CONTRAST"
-            desc = "Local contrast restored with Dynamic Stretch + CLAHE on L-channel"
+            desc = "Local contrast restored with CLAHE on L-channel"
 
         # 5. Condition BACKLIT: Shadow-lift + CLAHE
         elif condition == ImageCondition.BACKLIT:
@@ -145,3 +144,4 @@ class AdaptiveImageEnhancer:
             "time_ms": enhancement_time_ms,
             "description": desc,
         }
+

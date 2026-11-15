@@ -10,6 +10,17 @@ CAMERA_PORT = 5000
 STREAM_ENDPOINT = "video"
 CAMERA_URL = f"http://{CAMERA_IP}:{CAMERA_PORT}/{STREAM_ENDPOINT}"
 
+# Automatic Camera Detection & Fallback Configuration
+AUTO_CAMERA_DETECTION = True          # Automatically prioritize Local Webcam -> Fallback to IP Camera
+LOCAL_CAMERA_INDICES = [0, 1]         # Device indices to scan for local webcams (Primary source)
+LOCAL_CAMERA_TIMEOUT = 1.5            # Seconds timeout to probe local webcam
+NETWORK_STREAM_TIMEOUT = 1.0          # Seconds timeout for network stream reachability check
+CAMERA_FAILURE_THRESHOLD = 15         # Consecutive dropped frames before triggering reconnect/fallback
+CAMERA_RECONNECT_COOLDOWN = 3.0       # Minimum seconds between source switches to prevent thrashing
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+TARGET_FPS = 30
+
 # MediaPipe Hands Parameters
 # 0.45 confidence ensures rapid tracking lock during fast motion without dropping to palm detection
 MAX_NUM_HANDS = 2

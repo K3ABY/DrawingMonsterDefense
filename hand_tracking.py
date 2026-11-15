@@ -406,8 +406,8 @@ class HandTracker:
         - Dual-Zone boundaries & coordinates
         - Two-Hand Join gesture status, hold progress & cooldown
         """
-        panel_w = 310
-        panel_h = 445
+        panel_w = 320
+        panel_h = 464
         panel_y = 6
 
         overlay = frame.copy()
@@ -429,10 +429,14 @@ class HandTracker:
 
         curr_y = panel_y + 18
 
-        # Section 1: Performance Diagnostics & Image Quality Assessment
+        # Section 1: Performance Diagnostics, Camera Source & Image Quality
         cam_fps = perf_metrics.get("camera_fps", 0.0) if perf_metrics else 0.0
         proc_fps = perf_metrics.get("proc_fps", 0.0) if perf_metrics else 0.0
         proc_ms = perf_metrics.get("proc_ms", 0.0) if perf_metrics else 0.0
+        cam_mode = perf_metrics.get("camera_mode", "UNKNOWN") if perf_metrics else "UNKNOWN"
+        cam_status = perf_metrics.get("camera_status", "UNKNOWN") if perf_metrics else "UNKNOWN"
+        cam_res = perf_metrics.get("camera_res", "N/A") if perf_metrics else "N/A"
+        fallback_occ = perf_metrics.get("fallback_occurred", False) if perf_metrics else False
 
         cv2.putText(
             frame,
@@ -445,13 +449,28 @@ class HandTracker:
             cv2.LINE_AA,
         )
         curr_y += 16
+        # Camera mode and connection status
+        status_color = (0, 255, 128) if cam_status == "CONNECTED" else (0, 165, 255) if cam_status == "RECONNECTING" else (0, 0, 255)
+        cam_mode_text = f"Cam: {cam_mode} [{cam_status}] ({cam_res})"
+        cv2.putText(
+            frame,
+            cam_mode_text,
+            (panel_x + 12, curr_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.39,
+            status_color,
+            1,
+            cv2.LINE_AA,
+        )
+
+        curr_y += 15
         fps_text = f"Camera: {cam_fps:.1f} FPS | Proc: {proc_fps:.1f} FPS ({proc_ms:.1f} ms)"
         cv2.putText(
             frame,
             fps_text,
             (panel_x + 12, curr_y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.40,
+            0.39,
             (0, 255, 255),
             1,
             cv2.LINE_AA,
@@ -467,11 +486,25 @@ class HandTracker:
             loss_text,
             (panel_x + 12, curr_y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.39,
+            0.38,
             config.COLOR_TEXT,
             1,
             cv2.LINE_AA,
         )
+
+        if fallback_occ:
+            curr_y += 14
+            fb_msg = perf_metrics.get("fallback_message", "Fallback active") if perf_metrics else ""
+            cv2.putText(
+                frame,
+                f"Event: {fb_msg[:38]}",
+                (panel_x + 12, curr_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.36,
+                (0, 220, 255),
+                1,
+                cv2.LINE_AA,
+            )
 
         # Image Quality Assessment & Adaptive Enhancement
         curr_y += 15
@@ -785,6 +818,7 @@ def main():
     print("   - Crossing Zone Boundary: Stroke terminates immediately (no cross-lines)")
     print(" Keyboard Shortcuts:")
     print("   [Q] / [ESC] - Quit Application")
+    print("   [R] - Retry Camera Detection / Re-scan Sources")
     print("   [C] - Clear Canvas Drawings")
     print("   [D] - Toggle Debug HUD Overlay")
     print("   [S] - Toggle One Euro Landmark Smoothing")
@@ -792,19 +826,15 @@ def main():
     print("   [F] - Toggle Horizontal Mirroring")
     print("=" * 68)
 
-    # Initialize Camera Stream (Threaded for zero buffer latency)
+    # Initialize Camera Stream (Threaded with Auto-Detection & Fallback)
     if config.USE_THREADED_CAMERA:
-        print("[HandTracker] Starting Threaded Camera Stream (Zero-Latency mode)...")
-        cam = ThreadedCameraStream(config.CAMERA_URL)
-        time.sleep(0.5)
-        if not cam.is_connected:
-            print("[ERROR] Failed to connect to camera via ThreadedCameraStream. Exiting.")
-            sys.exit(1)
+        print("[HandTracker] Starting Unified Camera Stream (Auto-Detection & Fallback mode)...")
+        cam = ThreadedCameraStream(config.CAMERA_URL, auto_detect=getattr(config, "AUTO_CAMERA_DETECTION", True))
     else:
-        cam = cv2.VideoCapture(config.CAMERA_URL)
-        if not cam.isOpened():
+        cam = open_camera_stream(config.CAMERA_URL)
+        if cam is None:
             print(f"[ERROR] Cannot connect to camera stream at {config.CAMERA_URL}")
-            sys.exit(1)
+            cam = cv2.VideoCapture(0)
 
     tracker = HandTracker()
     gesture_ctrl = TwoHandJoinGestureController()
@@ -825,7 +855,7 @@ def main():
             # Read latest frame
             if config.USE_THREADED_CAMERA:
                 ret, frame, is_new = cam.read_latest()
-                if not ret or frame is None:
+                if frame is None:
                     time.sleep(0.01)
                     continue
             else:
@@ -835,28 +865,33 @@ def main():
                     time.sleep(0.02)
                     continue
 
-            if flip_horizontal:
+            if flip_horizontal and ret:
                 frame = cv2.flip(frame, 1)
 
             h_frame, w_frame, _ = frame.shape
             current_time = time.time()
 
-            # 1. Process hand tracking with adaptive One Euro Filter smoothing
-            hand_data, results = tracker.process(frame, current_time)
+            if ret:
+                # 1. Process hand tracking with adaptive One Euro Filter smoothing
+                hand_data, results = tracker.process(frame, current_time)
 
-            # 2. Update Two-Hand Join Gesture State Machine
-            state_changed = gesture_ctrl.update(hand_data, current_time)
-            if state_changed:
-                print(f"[Gesture] Event: {gesture_ctrl.last_event} -> Drawing State: {gesture_ctrl.drawing_state.value}")
+                # 2. Update Two-Hand Join Gesture State Machine
+                state_changed = gesture_ctrl.update(hand_data, current_time)
+                if state_changed:
+                    print(f"[Gesture] Event: {gesture_ctrl.last_event} -> Drawing State: {gesture_ctrl.drawing_state.value}")
 
-            # 3. Update Dual-Zone Air Drawing (with boundary enforcement, fist pause & gap recovery)
-            drawing_mgr.update(
-                hand_data,
-                gesture_ctrl.is_drawing_active,
-                current_time,
-                frame_width=w_frame,
-                frame_height=h_frame,
-            )
+                # 3. Update Dual-Zone Air Drawing (with boundary enforcement, fist pause & gap recovery)
+                drawing_mgr.update(
+                    hand_data,
+                    gesture_ctrl.is_drawing_active,
+                    current_time,
+                    frame_width=w_frame,
+                    frame_height=h_frame,
+                )
+            else:
+                # Camera disconnected / standby screen: keep tracking and drawing idle
+                hand_data = {"Left": None, "Right": None}
+                results = None
 
             # Measure processing latency
             t_proc_end = time.perf_counter()
@@ -870,11 +905,18 @@ def main():
             instant_fps = 1.0 / dt_loop if dt_loop > 0 else 0.0
             proc_fps = 0.9 * proc_fps + 0.1 * instant_fps
 
-            cam_metrics = cam.get_metrics() if config.USE_THREADED_CAMERA else {"camera_fps": proc_fps}
+            cam_metrics = cam.get_metrics() if config.USE_THREADED_CAMERA else {}
             perf_metrics = {
                 "camera_fps": cam_metrics.get("camera_fps", proc_fps),
                 "proc_fps": proc_fps,
                 "proc_ms": avg_proc_ms,
+                "camera_mode": cam_metrics.get("camera_mode", "UNKNOWN"),
+                "camera_status": cam_metrics.get("camera_status", "CONNECTED" if ret else "DISCONNECTED"),
+                "camera_source": cam_metrics.get("camera_source", str(config.CAMERA_URL)),
+                "camera_res": cam_metrics.get("camera_res", f"{w_frame}x{h_frame}"),
+                "fallback_occurred": cam_metrics.get("fallback_occurred", False),
+                "fallback_message": cam_metrics.get("fallback_message", "None"),
+                "error_message": cam_metrics.get("error_message", None),
             }
 
             # 4. Render visual annotations, Dual-Zone divider, HUD, strokes, and gesture feedback
@@ -883,10 +925,13 @@ def main():
             )
 
             # Status bar at bottom
+            cam_mode_badge = perf_metrics["camera_mode"]
+            cam_status_badge = perf_metrics["camera_status"]
             status_text = (
-                f"FPS: {proc_fps:.1f} | Draw: {'ACTIVE' if gesture_ctrl.is_drawing_active else 'IDLE'} | "
+                f"FPS: {proc_fps:.1f} | [{cam_mode_badge}: {cam_status_badge}] | "
+                f"Draw: {'ACTIVE' if gesture_ctrl.is_drawing_active else 'IDLE'} | "
                 f"HUD: {'ON' if tracker.show_hud else 'OFF'} | "
-                f"[Q]uit [C]lear [D]ebug [S]mooth [H]and [F]lip"
+                f"[R]etry Cam [Q]uit [C]lear [D]ebug [S]mooth [H]and [F]lip"
             )
             h_out, w_out, _ = output_frame.shape
             cv2.putText(
@@ -894,7 +939,7 @@ def main():
                 status_text,
                 (12, h_out - 12),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
+                0.42,
                 (0, 255, 255),
                 1,
                 cv2.LINE_AA,
@@ -908,6 +953,10 @@ def main():
             if key in [ord("q"), ord("Q"), 27]:
                 print("[HandTracker] Exit requested by user.")
                 break
+            elif key in [ord("r"), ord("R")]:
+                print("[HandTracker] Manual camera re-scan requested by user...")
+                if config.USE_THREADED_CAMERA:
+                    cam.retry_detection()
             elif key in [ord("c"), ord("C")]:
                 drawing_mgr.clear()
                 print("[DrawingManager] Canvas cleared by user.")
